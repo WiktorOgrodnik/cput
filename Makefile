@@ -2,7 +2,7 @@ CC = gcc
 SRC_DIR = src
 INC_DIR = .
 OBJ_DIR = obj
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Wno-unused-parameter -O2
+CFLAGS = -std=c11 -pthread -g -Wall -Wextra -Wpedantic -Wno-unused-parameter -O2
 NAME = cut
 OBJS = $(addprefix $(OBJ_DIR)/, main.o)
 
