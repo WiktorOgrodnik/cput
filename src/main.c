@@ -83,7 +83,7 @@ void* readstats() {
 
         sem_wait(&reader_buffer_empty);
         pthread_mutex_lock(&reader_buffer_mutex);
-        ring_buffer_push(reader_buffer, data_set);
+        ring_buffer_push(reader_buffer, (void*) data_set);
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_full);
 
@@ -138,9 +138,6 @@ void* analyze_stats() {
             cpu_rows->percentage = (float) (total_delta - idle_delta) * 100.0f / total_delta;
 
             analyzed_data_set->proc[analyzed_data_set->size++] = cpu_rows;
-        }
-
-        for (size_t i = 0; i < data_set1->size; i++) {
 
             free(data_set1->proc[i]);
             free(data_set2->proc[i]);
@@ -156,13 +153,6 @@ void* analyze_stats() {
 
         pthread_mutex_unlock(&analyzer_buffer_mutex);
         sem_post(&analyzer_buffer_full);
-
-        /*for (size_t i = 0; i < analyzed_data_set->size; i++) {
-            printf("Proc: %s, usage: %.2f%%\n", analyzed_data_set->proc[i]->cpu_name, analyzed_data_set->proc[i]->percentage * 100.0f);
-            free(analyzed_data_set->proc[i]);
-        }*/
-
-        //free(analyzed_data_set);
 
         sleep(1);
     }
