@@ -10,7 +10,7 @@
 #define ulong unsigned long
 
 typedef struct cpu_raw_data {
-    char* cpu_name;
+    char cpu_name [6];
     ulong data [10];
 } cpu_raw_data;
 
@@ -48,14 +48,19 @@ void* readstats() {
                 int it = 0;
                 while(it < 11) {
                     char* space = strchr(line, ' ');
-                    if (space != NULL)
-                        *space = '\0';
+                    if (*line == ' ') {
+                        line++;
+                        continue;
+                    }
+                    else if (space != NULL)
+                        *space = '\0'; // I will check later for memory leaks
+                    
 
                     if (it++) {
                         cpu_entry->data[it - 2] = atoi(line);
                     } else {
-                        cpu_entry->cpu_name = (char*)malloc(sizeof(char)*6);
-                        cpu_entry->cpu_name = strcpy(cpu_entry->cpu_name, line);
+                        //cpu_entry->cpu_name = (char*)malloc(sizeof(char)*6);
+                        strcpy(cpu_entry->cpu_name, line);
                     }
 
                     if (space != NULL)
@@ -68,7 +73,6 @@ void* readstats() {
                 }
                 printf("\n");
 
-                free(cpu_entry->cpu_name);
                 free(cpu_entry);
 
                 line = lineorigin;
