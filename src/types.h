@@ -30,4 +30,9 @@ typedef struct cpu_analyzed_data_set {
     cpu_analyzed_data* proc [100];
 } cpu_analyzed_data_set;
 
+typedef struct log_message {
+    char function [30];
+    char message [255];
+} log_message;
+
 #endif

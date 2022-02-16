@@ -4,9 +4,18 @@
 #include <pthread.h>
 #include <string.h>
 #include <semaphore.h>
+#include <errno.h>   
+#include <signal.h>                                                           
 
 #define READER_BUFFER_SIZE 20
 #define ANALYZER_BUFFER_SIZE 20
+#define STATE_MAX 102
+
+/** Threads **/
+pthread_t reader, analyzer, printer, watchdog;
+
+/** /proc/stat file **/
+FILE* procstat;
 
 /** Transfering data to analyzer **/
 ring_buffer* reader_buffer;
@@ -24,19 +33,59 @@ sem_t analyzer_buffer_full;
 
 pthread_mutex_t analyzer_buffer_mutex;
 
-void* readstats() {
+/* States for watchdog thread */
+
+ulong reader_state;
+ulong analyzer_state;
+ulong printer_state;
+
+/* Debug attribute */
+
+pthread_attr_t detachedThread;
+pthread_mutex_t debug_mutex;
+
+/* Debug file */
+FILE* logfile;
+
+/* Declarations */
+
+/** Main threads functions **/
+
+void* read_stats();
+void* analyze_stats();
+void* print_data();
+void* watchdog_function();
+
+/** Logger functions **/
+
+void* print_debug(void* args);
+void to_log(const char* function, const char* message);
+
+void clean();
+
+/** Functions bodies **/ 
+
+void sigterm_handler(int num) {
+    clean();
+    exit(EXIT_SUCCESS);
+}
+
+void* read_stats() {
     
     // Producer
-    FILE* procstat;
 
     while (true) {
+        reader_state = (reader_state + 1) % STATE_MAX;
         char* line = NULL;
         size_t length = 0;
         ssize_t read;
 
         if ((procstat = fopen("/proc/stat", "r")) == NULL) {
+            clean();
             exit(EXIT_FAILURE);
         }
+
+        to_log("read_stats", "Read raw data from /proc/stat");
 
         cpu_raw_data_set* data_set = (cpu_raw_data_set*)malloc(sizeof(cpu_raw_data_set));
         data_set->size = 0;
@@ -48,6 +97,7 @@ void* readstats() {
 
                 cpu_raw_data* cpu_entry = NULL;
                 if((cpu_entry = (cpu_raw_data*)malloc(sizeof(cpu_raw_data))) == NULL) {
+                    clean();
                     exit(EXIT_FAILURE);
                 }
 
@@ -87,6 +137,7 @@ void* readstats() {
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_full);
 
+        reader_state = (reader_state + 1) % STATE_MAX;
         usleep(1000000);
     }
 
@@ -96,7 +147,7 @@ void* readstats() {
 void* analyze_stats() {
 
     while(true) {
-
+        analyzer_state = (analyzer_state + 1) % STATE_MAX;
         sem_wait(&reader_buffer_full);
         sem_wait(&reader_buffer_full);
         pthread_mutex_lock(&reader_buffer_mutex);
@@ -110,6 +161,7 @@ void* analyze_stats() {
 
         if (data_set1 == NULL || data_set2 == NULL) {
             printf("Buffer was empty, but it shouldn't happen");
+            clean();
             exit(EXIT_FAILURE);
         }
 
@@ -143,6 +195,8 @@ void* analyze_stats() {
             free(data_set2->proc[i]);
         }
 
+        to_log("analyze_stats", "New data analyzed!");
+
         free(data_set1);
         free(data_set2);
 
@@ -154,6 +208,8 @@ void* analyze_stats() {
         pthread_mutex_unlock(&analyzer_buffer_mutex);
         sem_post(&analyzer_buffer_full);
 
+        analyzer_state = (analyzer_state + 1) % STATE_MAX;
+
         sleep(1);
     }
 
@@ -163,7 +219,7 @@ void* analyze_stats() {
 void* print_data() {
 
     while (true) {
-
+        printer_state = (printer_state + 1) % STATE_MAX;
         sem_wait(&analyzer_buffer_full);
         pthread_mutex_lock(&analyzer_buffer_mutex);
 
@@ -176,6 +232,7 @@ void* print_data() {
 
         if (data_set == NULL) {
             printf("Buffer was empty, but it shouldn't happen");
+            clean();
             exit(EXIT_FAILURE);
         }
 
@@ -185,15 +242,80 @@ void* print_data() {
         }
         free(data_set);
 
+        printer_state = (printer_state + 1) % STATE_MAX;
         sleep(1);
     }
 
     return NULL;
 }
 
+void* watchdog_function() {
+
+    while (true) {
+        ulong reader_state_old = reader_state;
+        ulong analyzer_state_old = analyzer_state;
+        ulong printer_state_old = printer_state;
+
+        sleep(2);
+
+        if (reader_state == reader_state_old || analyzer_state == analyzer_state_old || printer_state == printer_state_old) {
+            printf("The program is stuck! Closing...\n");
+
+            clean();
+
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    return NULL;
+}
+
+void* print_debug(void* args) {
+
+    log_message* log = (log_message*) args;
+
+    pthread_mutex_lock(&debug_mutex);
+    if ((logfile = fopen("debug.log", "a")) == NULL) {
+        printf("Failed to open log file!\n");
+    } else {
+        fprintf(logfile, "From %s: %s\n", log->function, log->message);
+        fclose(logfile);
+    }
+    
+    pthread_mutex_unlock(&debug_mutex);
+    free(log);
+
+    return NULL;
+}
+
+void to_log(const char* function, const char* message) {
+    pthread_t debug;
+    log_message* log = NULL;
+
+    if((log = (log_message*)malloc(sizeof(log_message))) == NULL) {
+        clean();
+        exit(EXIT_FAILURE);
+    }
+
+    sprintf(log->function, "%s", function);
+    sprintf(log->message, "%s", message);
+
+    int error = pthread_create(&debug, &detachedThread, &print_debug, log);
+    if (error) {
+        printf("Failed to log debug info\n");
+    }
+}  
+
 int main() {
 
+    signal(SIGTERM, sigterm_handler);
+
     int error = 0;
+
+    // Initialize states
+    reader_state = 0;
+    analyzer_state = 0;
+    printer_state = 0;
 
     // Initialize reader buffer
     sem_init(&reader_buffer_empty, 0, READER_BUFFER_SIZE);
@@ -211,19 +333,38 @@ int main() {
 
     analyzer_buffer = ring_buffer_new(ANALYZER_BUFFER_SIZE);
 
-    pthread_t reader, analyzer, printer;
-    error |= pthread_create(&reader, NULL, &readstats, NULL);
+    // Initialize detached attribute
+
+    pthread_attr_init(&detachedThread);
+    pthread_attr_setdetachstate(&detachedThread, PTHREAD_CREATE_DETACHED);
+
+    // Initialize debug mutex
+
+    pthread_mutex_init(&debug_mutex, NULL);
+
+    error |= pthread_create(&reader, NULL, &read_stats, NULL);
     error |= pthread_create(&analyzer, NULL, &analyze_stats, NULL);
     error |= pthread_create(&printer, NULL, &print_data, NULL);
+    error |= pthread_create(&watchdog, NULL, &watchdog_function, NULL);
+
 
     if (error) {
         printf("Problems with creating treads!\n");
+        clean();
         return EXIT_FAILURE;
     }
 
     pthread_join(reader, NULL);
     pthread_join(analyzer, NULL);
+    pthread_join(printer, NULL);
+    pthread_join(watchdog, NULL);
 
+    clean();
+
+    return EXIT_SUCCESS;
+}
+
+void clean() {
     ring_buffer_destroy(reader_buffer);
     ring_buffer_destroy(analyzer_buffer);
 
@@ -233,8 +374,19 @@ int main() {
     sem_destroy(&analyzer_buffer_empty);
     sem_destroy(&analyzer_buffer_full);
 
+    if (pthread_mutex_trylock(&debug_mutex) == -1 && errno == EBUSY) {
+        fclose(logfile);
+    }
+    fclose(procstat);
+
     pthread_mutex_destroy(&reader_buffer_mutex);
     pthread_mutex_destroy(&analyzer_buffer_mutex);
+    pthread_mutex_destroy(&debug_mutex);
 
-    return EXIT_SUCCESS;
+    pthread_kill(reader, SIGTERM);
+    pthread_kill(analyzer, SIGTERM);
+    pthread_kill(printer, SIGTERM);
+    pthread_kill(watchdog, SIGTERM);
+
+    pthread_attr_destroy(&detachedThread);
 }
