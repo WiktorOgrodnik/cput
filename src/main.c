@@ -130,6 +130,7 @@ void* read_stats() {
 
         fclose(procstat);
         free(line);
+        procstat = NULL;
 
         sem_wait(&reader_buffer_empty);
         pthread_mutex_lock(&reader_buffer_mutex);
@@ -260,9 +261,7 @@ void* watchdog_function() {
 
         if (reader_state == reader_state_old || analyzer_state == analyzer_state_old || printer_state == printer_state_old) {
             printf("The program is stuck! Closing...\n");
-
             clean();
-
             exit(EXIT_FAILURE);
         }
     }
@@ -280,6 +279,7 @@ void* print_debug(void* args) {
     } else {
         fprintf(logfile, "From %s: %s\n", log->function, log->message);
         fclose(logfile);
+        logfile = NULL;
     }
     
     pthread_mutex_unlock(&debug_mutex);
@@ -374,19 +374,19 @@ void clean() {
     sem_destroy(&analyzer_buffer_empty);
     sem_destroy(&analyzer_buffer_full);
 
-    if (pthread_mutex_trylock(&debug_mutex) == -1 && errno == EBUSY) {
+    if (logfile)
         fclose(logfile);
-    }
-    fclose(procstat);
+    if (procstat)
+        fclose(procstat);
 
     pthread_mutex_destroy(&reader_buffer_mutex);
     pthread_mutex_destroy(&analyzer_buffer_mutex);
     pthread_mutex_destroy(&debug_mutex);
 
-    pthread_kill(reader, SIGTERM);
-    pthread_kill(analyzer, SIGTERM);
-    pthread_kill(printer, SIGTERM);
-    pthread_kill(watchdog, SIGTERM);
+    pthread_cancel(reader);
+    pthread_cancel(analyzer);
+    pthread_cancel(printer);
+    pthread_cancel(watchdog);
 
     pthread_attr_destroy(&detachedThread);
 }
