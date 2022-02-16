@@ -3,7 +3,7 @@
 
 #include "types.h"
 
-#define T cpu_raw_data_set*
+#define T void*
 #define NO_VALUE NULL
 
 typedef struct ring_buffer {

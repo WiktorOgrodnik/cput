@@ -6,22 +6,29 @@
 #include <semaphore.h>
 
 #define READER_BUFFER_SIZE 20
+#define ANALYZER_BUFFER_SIZE 20
 
+/** Transfering data to analyzer **/
 ring_buffer* reader_buffer;
-size_t reader_buffer_size;
 
 sem_t reader_buffer_empty;
 sem_t reader_buffer_full;
 
 pthread_mutex_t reader_buffer_mutex;
 
+/** Transfering data to printer **/
+ring_buffer* analyzer_buffer;
+
+sem_t analyzer_buffer_empty;
+sem_t analyzer_buffer_full;
+
+pthread_mutex_t analyzer_buffer_mutex;
+
 void* readstats() {
     
     // Producer
     FILE* procstat;
 
-    int debug_counter = 0;
-    
     while (true) {
         char* line = NULL;
         size_t length = 0;
@@ -80,7 +87,7 @@ void* readstats() {
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_full);
 
-        usleep(500000);
+        usleep(1000000);
     }
 
     return NULL;
@@ -94,8 +101,8 @@ void* analyze_stats() {
         sem_wait(&reader_buffer_full);
         pthread_mutex_lock(&reader_buffer_mutex);
 
-        cpu_raw_data_set* data_set1 = ring_buffer_pop(reader_buffer);
-        cpu_raw_data_set* data_set2 = ring_buffer_pop(reader_buffer);
+        cpu_raw_data_set* data_set1 = (cpu_raw_data_set*) ring_buffer_pop(reader_buffer);
+        cpu_raw_data_set* data_set2 = (cpu_raw_data_set*) ring_buffer_pop(reader_buffer);
 
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_empty);
@@ -128,7 +135,7 @@ void* analyze_stats() {
             ulong idle_delta = idle - prev_idle;
 
             strcpy(cpu_rows->cpu_name, data_set1->proc[i]->cpu_name);
-            cpu_rows->percentage = (float) (total_delta - idle_delta) / total_delta;
+            cpu_rows->percentage = (float) (total_delta - idle_delta) * 100.0f / total_delta;
 
             analyzed_data_set->proc[analyzed_data_set->size++] = cpu_rows;
         }
@@ -142,12 +149,53 @@ void* analyze_stats() {
         free(data_set1);
         free(data_set2);
 
-        for (size_t i = 0; i < analyzed_data_set->size; i++) {
+        sem_wait(&analyzer_buffer_empty);
+        pthread_mutex_lock(&analyzer_buffer_mutex);
+
+        ring_buffer_push(analyzer_buffer, (void*) analyzed_data_set);
+
+        pthread_mutex_unlock(&analyzer_buffer_mutex);
+        sem_post(&analyzer_buffer_full);
+
+        /*for (size_t i = 0; i < analyzed_data_set->size; i++) {
             printf("Proc: %s, usage: %.2f%%\n", analyzed_data_set->proc[i]->cpu_name, analyzed_data_set->proc[i]->percentage * 100.0f);
             free(analyzed_data_set->proc[i]);
+        }*/
+
+        //free(analyzed_data_set);
+
+        sleep(1);
+    }
+
+    return NULL;
+}
+
+void* print_data() {
+
+    while (true) {
+
+        sem_wait(&analyzer_buffer_full);
+        pthread_mutex_lock(&analyzer_buffer_mutex);
+
+        cpu_analyzed_data_set* data_set = ring_buffer_pop(analyzer_buffer);
+
+        pthread_mutex_unlock(&analyzer_buffer_mutex);
+        sem_post(&analyzer_buffer_empty);
+
+        system("clear");
+
+        if (data_set == NULL) {
+            printf("Buffer was empty, but it shouldn't happen");
+            exit(EXIT_FAILURE);
         }
 
-        free(analyzed_data_set);
+        for (size_t i = 1; i < data_set->size; i++) {
+            printf("%s: %.1f%%\n", data_set->proc[i]->cpu_name, data_set->proc[i]->percentage);
+            free(data_set->proc[i]);
+        }
+        free(data_set);
+
+        sleep(1);
     }
 
     return NULL;
@@ -157,6 +205,7 @@ int main() {
 
     int error = 0;
 
+    // Initialize reader buffer
     sem_init(&reader_buffer_empty, 0, READER_BUFFER_SIZE);
     sem_init(&reader_buffer_full, 0, 0);
 
@@ -164,9 +213,18 @@ int main() {
 
     reader_buffer = ring_buffer_new(READER_BUFFER_SIZE);
 
-    pthread_t reader, analyzer;
+    // Initialize analyzer buffer
+    sem_init(&analyzer_buffer_empty, 0, ANALYZER_BUFFER_SIZE);
+    sem_init(&analyzer_buffer_full, 0, 0);
+
+    pthread_mutex_init(&analyzer_buffer_mutex, NULL);
+
+    analyzer_buffer = ring_buffer_new(ANALYZER_BUFFER_SIZE);
+
+    pthread_t reader, analyzer, printer;
     error |= pthread_create(&reader, NULL, &readstats, NULL);
     error |= pthread_create(&analyzer, NULL, &analyze_stats, NULL);
+    error |= pthread_create(&printer, NULL, &print_data, NULL);
 
     if (error) {
         printf("Problems with creating treads!\n");
@@ -177,11 +235,16 @@ int main() {
     pthread_join(analyzer, NULL);
 
     ring_buffer_destroy(reader_buffer);
+    ring_buffer_destroy(analyzer_buffer);
 
     sem_destroy(&reader_buffer_empty);
     sem_destroy(&reader_buffer_full);
 
+    sem_destroy(&analyzer_buffer_empty);
+    sem_destroy(&analyzer_buffer_full);
+
     pthread_mutex_destroy(&reader_buffer_mutex);
+    pthread_mutex_destroy(&analyzer_buffer_mutex);
 
     return EXIT_SUCCESS;
 }

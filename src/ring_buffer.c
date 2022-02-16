@@ -5,7 +5,7 @@ ring_buffer* ring_buffer_new(size_t size) {
     if ((buffer = (ring_buffer*)malloc(sizeof(ring_buffer))) == NULL)
         exit(EXIT_FAILURE);
     
-    buffer->values = (T*)malloc(sizeof(void*)*size);
+    buffer->values = (T*)malloc(sizeof(T)*size);
     buffer->head = 0;
     buffer->tail = 0;
     buffer->length = 0;
