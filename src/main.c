@@ -1,41 +1,23 @@
-#define _GNU_SOURCE
+#include "ring_buffer.h"
 
-#include <stdlib.h>
-#include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <stdbool.h>
 #include <string.h>
 #include <semaphore.h>
 
-#define ulong unsigned long
-
 #define READER_BUFFER_SIZE 20
 
-typedef struct cpu_raw_data {
-    char cpu_name [6];
-    ulong data [10];
-} cpu_raw_data;
-
-typedef struct cpu_raw_data_set {
-    size_t size;
-    cpu_raw_data* proc [100];
-} cpu_raw_data_set;
-
-cpu_raw_data_set* reader_buffer[READER_BUFFER_SIZE];
+ring_buffer* reader_buffer;
 size_t reader_buffer_size;
 
 sem_t reader_buffer_empty;
 sem_t reader_buffer_full;
 
+pthread_mutex_t reader_buffer_mutex;
+
 void* readstats() {
     
     // Producer
-
-    /* TO_DO 
-        Add to queue
-        If queue is full not commit any new rows
-    */
     FILE* procstat;
 
     int debug_counter = 0;
@@ -70,7 +52,7 @@ void* readstats() {
                         continue;
                     }
                     else if (space != NULL)
-                        *space = '\0'; // I will check later for memory leaks
+                        *space = '\0';
                     
 
                     if (it++) {
@@ -83,12 +65,6 @@ void* readstats() {
                         line = space + 1;
                 }
 
-                // printf("Retrieved data: %s ", cpu_entry->cpu_name);
-                // for (int i = 0; i < 10; i++) {
-                //     printf("%lu ", cpu_entry->data[i]);
-                // }
-                // printf("\n");
-
                 data_set->proc[data_set->size++] = cpu_entry;
 
                 line = lineorigin;
@@ -99,11 +75,79 @@ void* readstats() {
         free(line);
 
         sem_wait(&reader_buffer_empty);
-        reader_buffer[reader_buffer_size++] = data_set;
+        pthread_mutex_lock(&reader_buffer_mutex);
+        ring_buffer_push(reader_buffer, data_set);
+        pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_full);
 
-        printf("DEBUG: %d\n", debug_counter++);
+        usleep(500000);
+    }
 
+    return NULL;
+}
+
+void* analyze_stats() {
+
+    while(true) {
+
+        sem_wait(&reader_buffer_full);
+        sem_wait(&reader_buffer_full);
+        pthread_mutex_lock(&reader_buffer_mutex);
+
+        cpu_raw_data_set* data_set1 = ring_buffer_pop(reader_buffer);
+        cpu_raw_data_set* data_set2 = ring_buffer_pop(reader_buffer);
+
+        pthread_mutex_unlock(&reader_buffer_mutex);
+        sem_post(&reader_buffer_empty);
+        sem_post(&reader_buffer_empty);
+
+        if (data_set1 == NULL || data_set2 == NULL) {
+            printf("Buffer was empty, but it shouldn't happen");
+            exit(EXIT_FAILURE);
+        }
+
+        cpu_analyzed_data_set* analyzed_data_set = (cpu_analyzed_data_set*)malloc(sizeof(cpu_analyzed_data_set));
+        analyzed_data_set->size = 0;
+
+        for (size_t i = 0; i < data_set1->size; i++) {
+            cpu_analyzed_data* cpu_rows = (cpu_analyzed_data*)malloc(sizeof(cpu_analyzed_data));
+
+            ulong* data1 = data_set1->proc[i]->data;
+            ulong* data2 = data_set2->proc[i]->data;
+
+            ulong prev_idle = data1[3] + data1[4];
+            ulong idle = data2[3] + data2[4];
+
+            ulong prev_none_idle = data1[0] + data1[1] + data1[2] + data1[5] + data1[6] + data1[7];
+            ulong none_idle = data2[0] + data2[1] + data2[2] + data2[5] + data2[6] + data2[7];
+
+            ulong prev_total = prev_idle + prev_none_idle;
+            ulong total = idle + none_idle;
+
+            ulong total_delta = total - prev_total;
+            ulong idle_delta = idle - prev_idle;
+
+            strcpy(cpu_rows->cpu_name, data_set1->proc[i]->cpu_name);
+            cpu_rows->percentage = (float) (total_delta - idle_delta) / total_delta;
+
+            analyzed_data_set->proc[analyzed_data_set->size++] = cpu_rows;
+        }
+
+        for (size_t i = 0; i < data_set1->size; i++) {
+
+            free(data_set1->proc[i]);
+            free(data_set2->proc[i]);
+        }
+
+        free(data_set1);
+        free(data_set2);
+
+        for (size_t i = 0; i < analyzed_data_set->size; i++) {
+            printf("Proc: %s, usage: %.2f%%\n", analyzed_data_set->proc[i]->cpu_name, analyzed_data_set->proc[i]->percentage * 100.0f);
+            free(analyzed_data_set->proc[i]);
+        }
+
+        free(analyzed_data_set);
     }
 
     return NULL;
@@ -116,10 +160,13 @@ int main() {
     sem_init(&reader_buffer_empty, 0, READER_BUFFER_SIZE);
     sem_init(&reader_buffer_full, 0, 0);
 
-    reader_buffer_size = 0;
+    pthread_mutex_init(&reader_buffer_mutex, NULL);
 
-    pthread_t reader;
+    reader_buffer = ring_buffer_new(READER_BUFFER_SIZE);
+
+    pthread_t reader, analyzer;
     error |= pthread_create(&reader, NULL, &readstats, NULL);
+    error |= pthread_create(&analyzer, NULL, &analyze_stats, NULL);
 
     if (error) {
         printf("Problems with creating treads!\n");
@@ -127,9 +174,14 @@ int main() {
     }
 
     pthread_join(reader, NULL);
+    pthread_join(analyzer, NULL);
+
+    ring_buffer_destroy(reader_buffer);
 
     sem_destroy(&reader_buffer_empty);
     sem_destroy(&reader_buffer_full);
+
+    pthread_mutex_destroy(&reader_buffer_mutex);
 
     return EXIT_SUCCESS;
 }

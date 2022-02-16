@@ -4,7 +4,7 @@ INC_DIR = .
 OBJ_DIR = obj
 CFLAGS = -std=c11 -pthread -g -Wall -Wextra -Wpedantic -O2
 NAME = cut
-OBJS = $(addprefix $(OBJ_DIR)/, main.o)
+OBJS = $(addprefix $(OBJ_DIR)/, main.o ring_buffer.o types.o)
 
 all: $(OBJS)
 	@$(CC) $(CFLAGS) $(OBJS) -o $(NAME)
