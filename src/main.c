@@ -47,6 +47,8 @@ pthread_mutex_t debug_mutex;
 /* Debug file */
 FILE* logfile;
 
+bool reader_running, analyzer_running, printer_running, watchdog_running;
+
 /* Declarations */
 
 /** Main threads functions **/
@@ -65,7 +67,8 @@ void clean();
 
 /** Functions bodies **/ 
 
-void sigterm_handler(int num) {
+void sigterm_handler() {
+    printf("Received SIGTERM signal. Closing program safety...\n");
     clean();
     exit(EXIT_SUCCESS);
 }
@@ -74,7 +77,7 @@ void* read_stats() {
     
     // Producer
 
-    while (true) {
+    while (reader_running) {
         reader_state = (reader_state + 1) % STATE_MAX;
         char* line = NULL;
         size_t length = 0;
@@ -89,9 +92,16 @@ void* read_stats() {
 
         cpu_raw_data_set* data_set = (cpu_raw_data_set*)malloc(sizeof(cpu_raw_data_set));
         data_set->size = 0;
+        bool first = false;
 
         while((read = getline(&line, &length, procstat)) != -1) {
+
             if (strncmp(line, "cpu", 3) == 0) {
+
+                if (!first) {
+                    first = true;
+                    continue;
+                }
 
                 char* lineorigin = line;
 
@@ -101,8 +111,11 @@ void* read_stats() {
                     exit(EXIT_FAILURE);
                 }
 
+                cpu_entry->idle = 0;
+                cpu_entry->non_idle = 0;
+
                 int it = 0;
-                while(it < 11) {
+                while(it++ < 11) {
                     char* space = strchr(line, ' ');
                     if (*line == ' ') {
                         line++;
@@ -111,11 +124,10 @@ void* read_stats() {
                     else if (space != NULL)
                         *space = '\0';
                     
-
-                    if (it++) {
-                        cpu_entry->data[it - 2] = atol(line);
+                    if (it == 5 || it == 6) {
+                        cpu_entry->idle += atol(line);
                     } else {
-                        strcpy(cpu_entry->cpu_name, line);
+                        cpu_entry->non_idle += atol(line);
                     }
 
                     if (space != NULL)
@@ -134,7 +146,9 @@ void* read_stats() {
 
         sem_wait(&reader_buffer_empty);
         pthread_mutex_lock(&reader_buffer_mutex);
+
         ring_buffer_push(reader_buffer, (void*) data_set);
+
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_full);
 
@@ -147,11 +161,15 @@ void* read_stats() {
 
 void* analyze_stats() {
 
-    while(true) {
+    while (analyzer_running) {
         analyzer_state = (analyzer_state + 1) % STATE_MAX;
         sem_wait(&reader_buffer_full);
         sem_wait(&reader_buffer_full);
         pthread_mutex_lock(&reader_buffer_mutex);
+
+        if (!analyzer_running) {
+            return NULL;
+        }
 
         cpu_raw_data_set* data_set1 = (cpu_raw_data_set*) ring_buffer_pop(reader_buffer);
         cpu_raw_data_set* data_set2 = (cpu_raw_data_set*) ring_buffer_pop(reader_buffer);
@@ -161,39 +179,29 @@ void* analyze_stats() {
         sem_post(&reader_buffer_empty);
 
         if (data_set1 == NULL || data_set2 == NULL) {
-            printf("Buffer was empty, but it shouldn't happen");
-            clean();
-            exit(EXIT_FAILURE);
+            return NULL;
         }
 
         cpu_analyzed_data_set* analyzed_data_set = (cpu_analyzed_data_set*)malloc(sizeof(cpu_analyzed_data_set));
         analyzed_data_set->size = 0;
 
         for (size_t i = 0; i < data_set1->size; i++) {
-            cpu_analyzed_data* cpu_rows = (cpu_analyzed_data*)malloc(sizeof(cpu_analyzed_data));
 
-            ulong* data1 = data_set1->proc[i]->data;
-            ulong* data2 = data_set2->proc[i]->data;
+            cpu_raw_data* data1 = data_set1->proc[i];
+            cpu_raw_data* data2 = data_set2->proc[i];
 
-            ulong prev_idle = data1[3] + data1[4];
-            ulong idle = data2[3] + data2[4];
-
-            ulong prev_none_idle = data1[0] + data1[1] + data1[2] + data1[5] + data1[6] + data1[7];
-            ulong none_idle = data2[0] + data2[1] + data2[2] + data2[5] + data2[6] + data2[7];
-
-            ulong prev_total = prev_idle + prev_none_idle;
-            ulong total = idle + none_idle;
+            ulong prev_total = data1->idle + data1->non_idle;
+            ulong total = data2->idle + data2->non_idle;
 
             ulong total_delta = total - prev_total;
-            ulong idle_delta = idle - prev_idle;
+            ulong idle_delta = data2->idle - data1->idle;
 
-            strcpy(cpu_rows->cpu_name, data_set1->proc[i]->cpu_name);
-            cpu_rows->percentage = (float) (total_delta - idle_delta) * 100.0f / total_delta;
+            float percentage = (float) (total_delta - idle_delta) * 100.0f / total_delta;
 
-            analyzed_data_set->proc[analyzed_data_set->size++] = cpu_rows;
+            analyzed_data_set->percentage[analyzed_data_set->size++] = percentage;
 
-            free(data_set1->proc[i]);
-            free(data_set2->proc[i]);
+            free(data1);
+            free(data2);
         }
 
         to_log("analyze_stats", "New data analyzed!");
@@ -219,27 +227,28 @@ void* analyze_stats() {
 
 void* print_data() {
 
-    while (true) {
+    while (printer_running) {
         printer_state = (printer_state + 1) % STATE_MAX;
         sem_wait(&analyzer_buffer_full);
         pthread_mutex_lock(&analyzer_buffer_mutex);
+
+        if (!printer_running) {
+            return NULL;
+        }
 
         cpu_analyzed_data_set* data_set = ring_buffer_pop(analyzer_buffer);
 
         pthread_mutex_unlock(&analyzer_buffer_mutex);
         sem_post(&analyzer_buffer_empty);
 
-        system("clear");
-
         if (data_set == NULL) {
-            printf("Buffer was empty, but it shouldn't happen");
-            clean();
-            exit(EXIT_FAILURE);
+            return NULL;
         }
 
-        for (size_t i = 1; i < data_set->size; i++) {
-            printf("%s: %.1f%%\n", data_set->proc[i]->cpu_name, data_set->proc[i]->percentage);
-            free(data_set->proc[i]);
+        system("clear");
+
+        for (size_t i = 0; i < data_set->size; i++) {
+            printf("cpu%ld: %.1f%%\n", i, data_set->percentage[i]);
         }
         free(data_set);
 
@@ -252,16 +261,17 @@ void* print_data() {
 
 void* watchdog_function() {
 
-    while (true) {
+    while (watchdog_running) {
         ulong reader_state_old = reader_state;
         ulong analyzer_state_old = analyzer_state;
         ulong printer_state_old = printer_state;
 
         sleep(2);
+        to_log("watchdog", "watchdog sill is running");
 
         if (reader_state == reader_state_old || analyzer_state == analyzer_state_old || printer_state == printer_state_old) {
             printf("The program is stuck! Closing...\n");
-            clean();
+            if (reader_running) clean();
             exit(EXIT_FAILURE);
         }
     }
@@ -313,9 +323,11 @@ int main() {
     int error = 0;
 
     // Initialize states
-    reader_state = 0;
-    analyzer_state = 0;
-    printer_state = 0;
+    reader_state = analyzer_state = printer_state = 0;
+
+    // Initialize runnings
+
+    reader_running = analyzer_running = printer_running = watchdog_running = true;
 
     // Initialize reader buffer
     sem_init(&reader_buffer_empty, 0, READER_BUFFER_SIZE);
@@ -347,7 +359,6 @@ int main() {
     error |= pthread_create(&printer, NULL, &print_data, NULL);
     error |= pthread_create(&watchdog, NULL, &watchdog_function, NULL);
 
-
     if (error) {
         printf("Problems with creating treads!\n");
         clean();
@@ -365,6 +376,22 @@ int main() {
 }
 
 void clean() {
+
+    reader_running = analyzer_running = printer_running = watchdog_running = false;
+
+    pthread_mutex_unlock(&reader_buffer_mutex);
+    pthread_mutex_unlock(&analyzer_buffer_mutex);
+    sem_post(&reader_buffer_full);
+    sem_post(&reader_buffer_full);
+    sem_post(&reader_buffer_empty);
+    sem_post(&analyzer_buffer_empty);
+    sem_post(&analyzer_buffer_full);
+
+    pthread_join(reader, NULL);
+    pthread_join(analyzer, NULL);
+    pthread_join(printer, NULL);
+    pthread_join(watchdog, NULL);
+    
     ring_buffer_destroy(reader_buffer);
     ring_buffer_destroy(analyzer_buffer);
 
@@ -382,11 +409,6 @@ void clean() {
     pthread_mutex_destroy(&reader_buffer_mutex);
     pthread_mutex_destroy(&analyzer_buffer_mutex);
     pthread_mutex_destroy(&debug_mutex);
-
-    pthread_cancel(reader);
-    pthread_cancel(analyzer);
-    pthread_cancel(printer);
-    pthread_cancel(watchdog);
 
     pthread_attr_destroy(&detachedThread);
 }

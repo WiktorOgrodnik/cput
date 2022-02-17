@@ -23,6 +23,17 @@ bool ring_buffer_full(ring_buffer* r) {
 }
 
 void ring_buffer_destroy(ring_buffer* r) {
+    
+    if (r->length) {
+        size_t i = r->head;
+
+        do {
+            free(r->values[i]);
+            i = (i + 1) % r->size;
+        } while (i != r->tail);
+        
+    }
+    
     free(r->values);
     free(r);
 }

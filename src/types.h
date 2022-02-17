@@ -11,8 +11,8 @@
 #define ulong unsigned long
 
 typedef struct cpu_raw_data {
-    char cpu_name [6];
-    ulong data [10];
+    ulong idle;
+    ulong non_idle;
 } cpu_raw_data;
 
 typedef struct cpu_raw_data_set {
@@ -20,14 +20,9 @@ typedef struct cpu_raw_data_set {
     cpu_raw_data* proc [100];
 } cpu_raw_data_set;
 
-typedef struct cpu_analyzed_data {
-    char cpu_name[6];
-    float percentage;
-} cpu_analyzed_data;
-
 typedef struct cpu_analyzed_data_set {
     size_t size;
-    cpu_analyzed_data* proc [100];
+    float percentage [100];
 } cpu_analyzed_data_set;
 
 typedef struct log_message {
