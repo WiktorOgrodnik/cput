@@ -2,13 +2,13 @@
 
 ## Information
 
-Simple program for linux computers which displays simple percentage information about CPU usage for each thread.
+The simple program that displays percentage information about CPU usage for each thread. Works only on Linux computers.
 
 ![Sreen](./img1.png)
 
 ## Installation
 
-In terminal, inside cput folder type:
+In the terminal, inside cput folder type:
 
 ```bash
 mkdir obj
