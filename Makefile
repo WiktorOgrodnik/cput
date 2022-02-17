@@ -2,8 +2,8 @@ CC = gcc
 SRC_DIR = src
 INC_DIR = .
 OBJ_DIR = obj
-CFLAGS = -std=c11 -pthread -g -Wall -Wextra -Wpedantic -O2
-NAME = cut
+CFLAGS = -std=c11 -pthread -g -Wall -Wextra -Wpedantic -Werror -O2
+NAME = cput
 OBJS = $(addprefix $(OBJ_DIR)/, main.o ring_buffer.o types.o)
 
 all: $(OBJS)
