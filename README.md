@@ -11,7 +11,6 @@ The simple program that displays percentage information about CPU usage for each
 In the terminal, inside cput folder type:
 
 ```bash
-mkdir obj
 make
 ```
 

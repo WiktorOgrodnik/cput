@@ -9,7 +9,11 @@
 
 #define READER_BUFFER_SIZE 20
 #define ANALYZER_BUFFER_SIZE 20
-#define STATE_MAX 102
+
+#define WATCHDOG_TIMEOUT 3
+#define ROUND_TIME 1
+
+bool to_kill_program = false;
 
 /** Threads **/
 pthread_t reader, analyzer, printer, watchdog;
@@ -33,12 +37,6 @@ sem_t analyzer_buffer_full;
 
 pthread_mutex_t analyzer_buffer_mutex;
 
-/* States for watchdog thread */
-
-ulong reader_state;
-ulong analyzer_state;
-ulong printer_state;
-
 /* Debug attribute */
 
 pthread_attr_t detachedThread;
@@ -46,8 +44,6 @@ pthread_mutex_t debug_mutex;
 
 /* Debug file */
 FILE* logfile;
-
-bool reader_running, analyzer_running, printer_running, watchdog_running;
 
 /* Declarations */
 
@@ -69,30 +65,27 @@ void clean();
 
 void sigterm_handler() {
     printf("Received SIGTERM signal. Closing program safety...\n");
-    clean();
     exit(EXIT_SUCCESS);
 }
 
 void* read_stats() {
     
     // Producer
+    struct timespec timeout;
 
-    while (reader_running) {
-        reader_state = (reader_state + 1) % STATE_MAX;
+    uint64_t idles[512];
+    uint64_t non_idles[512];
+
+    for (;;) {
+
         char* line = NULL;
         size_t length = 0;
-        ssize_t read;
-
-        if ((procstat = fopen("/proc/stat", "r")) == NULL) {
-            clean();
-            exit(EXIT_FAILURE);
-        }
-
-        to_log("read_stats", "Read raw data from /proc/stat");
-
-        cpu_raw_data_set* data_set = (cpu_raw_data_set*)malloc(sizeof(cpu_raw_data_set));
-        data_set->size = 0;
+        ssize_t read = 0;
+        size_t size = 0;
         bool first = false;
+
+        if ((procstat = fopen("/proc/stat", "r")) == NULL) exit(EXIT_FAILURE);
+        to_log("read_stats", "Read raw data from /proc/stat");
 
         while((read = getline(&line, &length, procstat)) != -1) {
 
@@ -104,17 +97,9 @@ void* read_stats() {
                 }
 
                 char* lineorigin = line;
+                uint64_t idle = 0, non_idle = 0;
+                size_t it = 0;
 
-                cpu_raw_data* cpu_entry = NULL;
-                if((cpu_entry = (cpu_raw_data*)malloc(sizeof(cpu_raw_data))) == NULL) {
-                    clean();
-                    exit(EXIT_FAILURE);
-                }
-
-                cpu_entry->idle = 0;
-                cpu_entry->non_idle = 0;
-
-                int it = 0;
                 while(it++ < 11) {
                     char* space = strchr(line, ' ');
                     if (*line == ' ') {
@@ -125,26 +110,41 @@ void* read_stats() {
                         *space = '\0';
                     
                     if (it == 5 || it == 6) {
-                        cpu_entry->idle += atol(line);
+                        idle += atol(line);
                     } else {
-                        cpu_entry->non_idle += atol(line);
+                        non_idle += atol(line);
                     }
 
                     if (space != NULL)
                         line = space + 1;
                 }
 
-                data_set->proc[data_set->size++] = cpu_entry;
+                idles[size] = idle;
+                non_idles[size++] = non_idle;
 
                 line = lineorigin;
             }
+        }
+
+        cpu_raw_data_set* data_set = NULL;
+        if ((data_set = (cpu_raw_data_set*)malloc(sizeof(cpu_raw_data_set) + size * sizeof(cpu_raw_data))) == NULL)
+            exit(EXIT_FAILURE);
+
+        data_set->size = size;
+
+        for (size_t i = 0; i < size; i++) {
+            data_set->proc[i].idle = idles[i];
+            data_set->proc[i].non_idle = non_idles[i];
         }
 
         fclose(procstat);
         free(line);
         procstat = NULL;
 
-        sem_wait(&reader_buffer_empty);
+        timespec_get(&timeout, TIME_UTC);
+        timeout.tv_sec += WATCHDOG_TIMEOUT;
+        if (sem_timedwait(&reader_buffer_empty, &timeout) < 0)
+            to_kill_program = true;
         pthread_mutex_lock(&reader_buffer_mutex);
 
         ring_buffer_push(reader_buffer, (void*) data_set);
@@ -152,8 +152,7 @@ void* read_stats() {
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_full);
 
-        reader_state = (reader_state + 1) % STATE_MAX;
-        usleep(1000000);
+        sleep(ROUND_TIME);
     }
 
     return NULL;
@@ -161,65 +160,60 @@ void* read_stats() {
 
 void* analyze_stats() {
 
-    while (analyzer_running) {
-        analyzer_state = (analyzer_state + 1) % STATE_MAX;
-        sem_wait(&reader_buffer_full);
-        sem_wait(&reader_buffer_full);
+    struct timespec timeout;
+
+    for (;;) {
+
+        timespec_get(&timeout, TIME_UTC);
+        timeout.tv_sec += WATCHDOG_TIMEOUT;
+
+        if(sem_timedwait(&reader_buffer_full, &timeout) < 0)
+            to_kill_program = true;
         pthread_mutex_lock(&reader_buffer_mutex);
 
-        if (!analyzer_running) {
-            return NULL;
-        }
-
-        cpu_raw_data_set* data_set1 = (cpu_raw_data_set*) ring_buffer_pop(reader_buffer);
-        cpu_raw_data_set* data_set2 = (cpu_raw_data_set*) ring_buffer_pop(reader_buffer);
+        cpu_raw_data_set* data_set_last = (cpu_raw_data_set*)ring_buffer_pop(reader_buffer);
+        cpu_raw_data_set* data_set_top = (cpu_raw_data_set*)ring_buffer_top(reader_buffer);
 
         pthread_mutex_unlock(&reader_buffer_mutex);
         sem_post(&reader_buffer_empty);
-        sem_post(&reader_buffer_empty);
 
-        if (data_set1 == NULL || data_set2 == NULL) {
-            return NULL;
+        cpu_analyzed_data_set* analyzed_data_set = NULL;
+        if ((analyzed_data_set = (cpu_analyzed_data_set*)malloc(sizeof(cpu_analyzed_data_set) + data_set_last->size * sizeof(float))) == NULL)
+            exit(EXIT_FAILURE);
+
+        analyzed_data_set->size = data_set_last->size;
+
+        for (size_t i = 0; i < data_set_last->size; i++) {
+
+            cpu_raw_data data_last = data_set_last->proc[i];
+            cpu_raw_data data_top = data_set_top->proc[i];
+
+            uint64_t prev_total = data_last.idle + data_last.non_idle;
+            uint64_t total = data_top.idle + data_top.non_idle;
+
+            uint64_t total_delta = total - prev_total;
+            uint64_t idle_delta = data_top.idle - data_last.idle;
+
+            float percentage = (float)(total_delta - idle_delta) * 100.0f / total_delta;
+
+            analyzed_data_set->percentage[i] = percentage;
         }
 
-        cpu_analyzed_data_set* analyzed_data_set = (cpu_analyzed_data_set*)malloc(sizeof(cpu_analyzed_data_set));
-        analyzed_data_set->size = 0;
-
-        for (size_t i = 0; i < data_set1->size; i++) {
-
-            cpu_raw_data* data1 = data_set1->proc[i];
-            cpu_raw_data* data2 = data_set2->proc[i];
-
-            ulong prev_total = data1->idle + data1->non_idle;
-            ulong total = data2->idle + data2->non_idle;
-
-            ulong total_delta = total - prev_total;
-            ulong idle_delta = data2->idle - data1->idle;
-
-            float percentage = (float) (total_delta - idle_delta) * 100.0f / total_delta;
-
-            analyzed_data_set->percentage[analyzed_data_set->size++] = percentage;
-
-            free(data1);
-            free(data2);
-        }
-
+        free(data_set_last);
         to_log("analyze_stats", "New data analyzed!");
 
-        free(data_set1);
-        free(data_set2);
-
-        sem_wait(&analyzer_buffer_empty);
+        timespec_get(&timeout, TIME_UTC);
+        timeout.tv_sec += WATCHDOG_TIMEOUT;
+        if (sem_timedwait(&analyzer_buffer_empty, &timeout) < 0) 
+            to_kill_program = true;
         pthread_mutex_lock(&analyzer_buffer_mutex);
 
-        ring_buffer_push(analyzer_buffer, (void*) analyzed_data_set);
+        ring_buffer_push(analyzer_buffer, (void*)analyzed_data_set);
 
         pthread_mutex_unlock(&analyzer_buffer_mutex);
         sem_post(&analyzer_buffer_full);
 
-        analyzer_state = (analyzer_state + 1) % STATE_MAX;
-
-        sleep(1);
+        sleep(ROUND_TIME);
     }
 
     return NULL;
@@ -227,33 +221,29 @@ void* analyze_stats() {
 
 void* print_data() {
 
-    while (printer_running) {
-        printer_state = (printer_state + 1) % STATE_MAX;
-        sem_wait(&analyzer_buffer_full);
-        pthread_mutex_lock(&analyzer_buffer_mutex);
+    struct timespec timeout;
 
-        if (!printer_running) {
-            return NULL;
-        }
+    for (;;) {
+
+        timespec_get(&timeout, TIME_UTC);
+        timeout.tv_sec += WATCHDOG_TIMEOUT;
+        if (sem_timedwait(&analyzer_buffer_full, &timeout) < 0)
+            to_kill_program = true;
+        pthread_mutex_lock(&analyzer_buffer_mutex);
 
         cpu_analyzed_data_set* data_set = ring_buffer_pop(analyzer_buffer);
 
         pthread_mutex_unlock(&analyzer_buffer_mutex);
         sem_post(&analyzer_buffer_empty);
 
-        if (data_set == NULL) {
-            return NULL;
-        }
-
-        system("clear");
+        if (system("clear") < 0) exit(EXIT_FAILURE);
 
         for (size_t i = 0; i < data_set->size; i++) {
             printf("cpu%ld: %.1f%%\n", i, data_set->percentage[i]);
         }
         free(data_set);
 
-        printer_state = (printer_state + 1) % STATE_MAX;
-        sleep(1);
+        sleep(ROUND_TIME);
     }
 
     return NULL;
@@ -261,17 +251,14 @@ void* print_data() {
 
 void* watchdog_function() {
 
-    while (watchdog_running) {
-        ulong reader_state_old = reader_state;
-        ulong analyzer_state_old = analyzer_state;
-        ulong printer_state_old = printer_state;
+    // select here
+    for (;;) {
 
-        sleep(2);
-        to_log("watchdog", "watchdog sill is running");
+        sleep(WATCHDOG_TIMEOUT);
+        to_log("watchdog", "watchdog is still running");
 
-        if (reader_state == reader_state_old || analyzer_state == analyzer_state_old || printer_state == printer_state_old) {
+        if (to_kill_program) {
             printf("The program is stuck! Closing...\n");
-            if (reader_running) clean();
             exit(EXIT_FAILURE);
         }
     }
@@ -281,7 +268,7 @@ void* watchdog_function() {
 
 void* print_debug(void* args) {
 
-    log_message* log = (log_message*) args;
+    log_message* log = (log_message*)args;
 
     pthread_mutex_lock(&debug_mutex);
     if ((logfile = fopen("debug.log", "a")) == NULL) {
@@ -322,20 +309,21 @@ int main() {
 
     int error = 0;
 
-    // Initialize states
-    reader_state = analyzer_state = printer_state = 0;
-
-    // Initialize runnings
-
-    reader_running = analyzer_running = printer_running = watchdog_running = true;
-
     // Initialize reader buffer
     sem_init(&reader_buffer_empty, 0, READER_BUFFER_SIZE);
     sem_init(&reader_buffer_full, 0, 0);
 
     pthread_mutex_init(&reader_buffer_mutex, NULL);
 
-    reader_buffer = ring_buffer_new(READER_BUFFER_SIZE);
+    reader_buffer = ring_buffer_new(READER_BUFFER_SIZE + 1);
+    
+    cpu_raw_data_set* val;
+    if ((val = (cpu_raw_data_set*)malloc(sizeof(cpu_raw_data_set))) == NULL)
+        return EXIT_FAILURE;
+
+    val->size = 0;
+
+    ring_buffer_push(reader_buffer, val);
 
     // Initialize analyzer buffer
     sem_init(&analyzer_buffer_empty, 0, ANALYZER_BUFFER_SIZE);
@@ -376,8 +364,6 @@ int main() {
 }
 
 void clean() {
-
-    reader_running = analyzer_running = printer_running = watchdog_running = false;
 
     pthread_mutex_unlock(&reader_buffer_mutex);
     pthread_mutex_unlock(&analyzer_buffer_mutex);

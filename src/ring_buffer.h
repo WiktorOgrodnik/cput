@@ -17,5 +17,6 @@ bool ring_buffer_full(ring_buffer* r);
 void ring_buffer_destroy(ring_buffer* r);
 void ring_buffer_push(ring_buffer* r, T val);
 T ring_buffer_pop(ring_buffer* r);
+T ring_buffer_top(ring_buffer* r);
 
 #endif

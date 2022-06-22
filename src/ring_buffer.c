@@ -58,3 +58,11 @@ T ring_buffer_pop(ring_buffer* r) {
     return val;
 }
 
+T ring_buffer_top(ring_buffer* r) {
+    if (ring_buffer_empty(r))
+        return NO_VALUE;
+
+    T val = r->values[r->head];
+    return val;
+}
+
